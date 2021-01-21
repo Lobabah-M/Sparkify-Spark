@@ -1,6 +1,9 @@
 import configparser
+from datetime import datetime
 import os
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import monotonically_increasing_id
+from pyspark.sql.functions import year, month, dayofweek, hour, weekofyear, to_timestamp
 
 
 
@@ -67,7 +70,93 @@ def process_song_data(spark, input_data, output_data):
 
 
 def process_log_data(spark, input_data, output_data):
+    """
+    - reads all the log data from S3 into a dataframe
+    - extracts columns to create users, time tables
+    - creats songplays table by joining song data and log data
+    - writes users, time and songplays tables to parquet files in S3
+    """
+    # get filepath to log data file
+    log_data = input_data + "log_data/*/*/*.json"
 
+    # read log data file
+    df = spark.read.json(log_data)
+    
+    # filter by actions for song plays
+    df.createOrReplaceTempView("log_data")
+    df = spark.sql("""SELECT * 
+                      From log_data
+                      Where page='NextSong'
+                      """)
+
+    # extract columns for users table    
+    df.createOrReplaceTempView("log_data")
+    users_table = spark.sql("""SELECT DISTINCT userId as user_id, 
+                                  firstName as first_name, 
+                                  lastName as last_name, 
+                                  gender, 
+                                  level
+                            FROM log_data
+                            WHERE userId IS NOT NULL""")
+    
+    # write users table to parquet files
+    (users_table
+     .write
+     .mode('overwrite')
+     .parquet(output_data+'users/')
+    )
+
+    # create timestamp column from original timestamp column
+    df = df.withColumn("ts", to_timestamp(df.ts/1000))
+    
+    # extract columns to create time table
+    df.createOrReplaceTempView("log_data")
+    time_table = spark.sql("""SELECT DISTINCT ts as start_time, 
+                                     hour(ts) as hour, 
+                                     day(ts) as day,
+                                     weekofyear(ts) as week,
+                                     month(ts) as month,
+                                     year(ts) as year,
+                                     dayofweek(ts) as weekday
+                            
+                              FROM log_data
+                              WHERE ts IS NOT NULL""")
+    
+    # write time table to parquet files partitioned by year and month
+    (time_table
+     .write
+     .mode('overwrite')
+     .partitionBy("year", "month")
+     .parquet(output_data+'time/')
+    )
+
+    # read in song data to use for songplays table
+    song_df = spark.read.parquet("songs/")
+    song_df.createOrReplaceTempView("song_data")
+
+    # extract columns from joined song and log datasets to create songplays table 
+    songplays_table = spark.sql("""SELECT l.ts as start_time, 
+                                      l.userId as user_id, 
+                                      l.level, 
+                                      s.song_id, 
+                                      s.artist_id, 
+                                      l.sessionId as session_id, 
+                                      l.location, 
+                                      l.userAgent,
+                                      month(ts) as month,
+                                      year(ts) as year
+                                FROM song_data s
+                                JOIN log_data l ON (l.song=s.title)
+                                WHERE l.page='NextSong'""")
+    songplays_table= songplays_table.withColumn("songplay_id", monotonically_increasing_id())
+    
+    # write songplays table to parquet files partitioned by year and month
+    (songplays_table
+     .write
+     .mode('overwrite')
+     .partitionBy("year", "month")
+     .parquet(output_data+'songplays/')
+    )
 
 def main():
     """
